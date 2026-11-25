@@ -1,24 +1,17 @@
-# ربات موزیکال روبیکا — پکیج کامل APK + ترموکس + گیت‌هاب
-👑 **سازنده:** پریا چش رنگی
+# ربات موزیکال پیشرفته روبیکا (سازنده: پریا چش رنگی)
 
-این پکیج شامل دو روش واقعی و آماده برای اجرای ربات روی گوشی اندروید با **Termux** و ساخت **APK** در **GitHub Actions** است:
+این مخزن شامل **ربات کامل پایتون روبیکا** به همراه **ساخت خودکار فایل نصب اندروید (APK) در گیت‌هاب** است.
 
----
-
-## ۱. نصب و ساخت خودکار APK از داخل ترموکس (سریع‌ترین روش)
-وارد برنامه **Termux** شوید و این دستور را اجرا کنید:
+## ۱. اجرای مستقیم ربات پایتون
 ```bash
-pkg update -y && pkg install -y curl unzip git python gh && curl -fsSL "http://127.0.0.1:3000/api/export/termux-bootstrap.sh?appUrl=http%3A%2F%2F127.0.0.1%3A3000" -o install.sh && bash install.sh
+cd bot
+pip install -r requirements.txt
+export RUBIKA_BOT_TOKEN="CJFFDA0HNOILFTCHIHGBTUDMVZVYGBHBMWNYLEXPHMKBNUIJGLZIOCHQFQFNAZZP"
+python3 rubika_music_bot.py
 ```
 
-پس از اجرا، منوی ترموکس باز می‌شود:
-- **گزینه ۱**: اجرای ربات موزیکال در ترموکس روی پورت `3000` (اپلیکیشن APK مستقیماً به `127.0.0.1:3000` وصل می‌شود).
-- **گزینه ۲**: ورود به گیت‌هاب (`gh auth login`)، آپلود خودکار فایل‌ها، اجرای ساخت APK در GitHub Actions و دانلود فایل `.apk` مستقیم داخل پوشه `Download/ParyaRubikaAPK` گوشی!
-
----
-
-## ۲. دو فایل APK خروجی در GitHub Actions
-1. **`ParyaRubikaPanel-APK` (~۹۰ ثانیه ساخت):**
-   اپلیکیشن اندروید بومی (Gradle WebView) با پشتیبانی همزمان از **ترموکس محلی (`127.0.0.1:3000`)** و **پنل آنلاین**، مجوز میکروفون/صدا و پخش در ویسکال.
-2. **`ParyaRubikaBot-Kivy-APK`:**
-   اپلیکیشن مستقل پایتون (Kivy + Buildozer) برای اجرای ربات روبیکا بدون نیاز به ترموکس.
+## ۲. ساخت فایل APK رایگان با GitHub Actions
+1. یک مخزن جدید (Repository) در گیت‌هاب خود بسازید.
+2. فایل‌های همین پکیج را به مخزن پوش (Push) یا آپلود کنید.
+3. وارد تب **Actions** در گیت‌هاب شوید و روی **Build Android APK (Parya Rubika Music Bot)** کلیک کنید و گزینه **Run workflow** را بزنید.
+4. پس از اتمام ساخت (~۸ دقیقه)، از بخش **Artifacts** فایل `ParyaRubikaMusicBot-APK` را دانلود و روی گوشی اندروید نصب کنید.

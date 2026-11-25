@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-اپلیکیشن اندروید مستقل Kivy ربات موزیکال روبیکا (ساخت APK با Buildozer & GitHub Actions)
+اپلیکیشن اندروید ربات موزیکال روبیکا (ساخت APK با Buildozer & GitHub Actions)
 سازنده: پریا چش رنگی
 """
 
-import asyncio
 import os
 import threading
+import asyncio
 
 from kivy.app import App
 from kivy.clock import Clock
@@ -25,14 +25,14 @@ Window.clearcolor = (0.043, 0.059, 0.09, 1)
 
 class ParyaRubikaApp(App):
     def build(self):
-        self.title = "Rubika Music Bot"
+        self.title = "Rubika Music Bot - پریا چش رنگی"
         self.bot = None
         self.bot_thread = None
 
         root = BoxLayout(orientation="vertical", padding=16, spacing=12)
 
         header = Label(
-            text="Parya Rubika Music Bot\nStandalone Bot + Local Server :3000",
+            text="Parya Rubika Music Bot\nToken Ready | Voice Call & Group Controller",
             size_hint=(1, 0.14),
             color=(0.06, 0.72, 0.50, 1),
             font_size="18sp",
@@ -41,7 +41,7 @@ class ParyaRubikaApp(App):
         root.add_widget(header)
 
         self.token_input = TextInput(
-            text=os.getenv("RUBIKA_BOT_TOKEN", ""),
+            text=os.getenv("RUBIKA_BOT_TOKEN", "CJFFDA0HNOILFTCHIHGBTUDMVZVYGBHBMWNYLEXPHMKBNUIJGLZIOCHQFQFNAZZP"),
             multiline=False,
             size_hint=(1, 0.09),
             background_color=(0.08, 0.11, 0.16, 1),
@@ -90,7 +90,7 @@ class ParyaRubikaApp(App):
         def _runner():
             try:
                 self.append_log("[Start] Connecting to botapi.rubika.ir/v3 ...")
-                asyncio.run(self.bot.run(with_web=True))
+                asyncio.run(self.bot.run())
             except Exception as e:
                 self.append_log(f"[Error] {e}")
 

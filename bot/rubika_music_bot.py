@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ربات موزیکال پیشرفته روبیکا + وب‌سرور کنترلر ترموکس (پورت 3000)
+ربات موزیکال پیشرفته روبیکا (کاربر محور)
 سازنده: پریا چش رنگی
-سازگار با Termux، اندروید APK، و سرور لینوکس
+پشتیبانی از Bot API v3 و کلاینت Userbot (rubpy) برای مدیریت ویسکال گروهی
 """
 
 import asyncio
@@ -17,22 +17,13 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
 import aiohttp
-from aiohttp import web
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
-
-BOT_TOKEN = os.getenv("RUBIKA_BOT_TOKEN", "")
+# تنظیمات اصلی ربات
+BOT_TOKEN = os.getenv("RUBIKA_BOT_TOKEN", "CJFFDA0HNOILFTCHIHGBTUDMVZVYGBHBMWNYLEXPHMKBNUIJGLZIOCHQFQFNAZZP")
 CREATOR_NAME = "پریا چش رنگی"
 CREATOR_ID = os.getenv("RUBIKA_CREATOR_ID", "u0_parya_creator")
-PORT = int(os.getenv("PORT", "3000"))
+API_BASE = f"https://botapi.rubika.ir/v3/{BOT_TOKEN}"
 DB_PATH = os.getenv("BOT_DB_PATH", "parya_music_bot.db")
-
-def get_api_base(tok: str) -> str:
-    return f"https://botapi.rubika.ir/v3/{tok.strip()}"
 
 HELP_TEXT = f"""🎵 راهنمای ربات موزیکال پیشرفته روبیکا
 👑 سازنده: {CREATOR_NAME}
@@ -53,7 +44,7 @@ HELP_TEXT = f"""🎵 راهنمای ربات موزیکال پیشرفته رو�
 • روی فایل صوتی یا لینک ریپلای کنید و ارسال کنید: پخش ریپلای
 
 🎲 پخش تصادفی:
-• پخش رندوم / پخش رندوم شاد / پخش رندوم غمگین
+• پخش رندوم
 
 📋 مدیریت صف و تاریخچه:
 • بعدی — پخش آهنگ بعدی از صف
@@ -80,9 +71,8 @@ HELP_TEXT = f"""🎵 راهنمای ربات موزیکال پیشرفته رو�
 • دسترسی عموم باز / دسترسی عموم قفل باشد
 • مقام — نمایش مقام شما در گروه
 
-📞 کال و اشتراک و تایمر:
+📞 کال و اشتراک:
 • ساخت کال — ایجاد ویس چت در گروه
-• تنظیم خاموشی 23:30 / لغو خاموشی
 • وضعیت — نمایش تاریخ خرید، انقضا و دسترسی"""
 
 
@@ -110,9 +100,29 @@ class BotDatabase:
                 history_json TEXT DEFAULT '[]',
                 purchased_at TEXT,
                 expires_at TEXT,
-                auto_shutdown_time TEXT
+                auto_shutdown_time TEXT,
+                active_menu TEXT DEFAULT 'main',
+                daily_play_date TEXT,
+                daily_play_count INTEGER DEFAULT 0,
+                daily_play_limit INTEGER DEFAULT 10,
+                muted_users_json TEXT DEFAULT '[]',
+                warnings_json TEXT DEFAULT '{}',
+                filtered_words_json TEXT DEFAULT '[]'
             )
         """)
+        existing_cols = {r[1] for r in cur.execute("PRAGMA table_info(groups)").fetchall()}
+        migrations = {
+            "active_menu": "TEXT DEFAULT 'main'",
+            "daily_play_date": "TEXT",
+            "daily_play_count": "INTEGER DEFAULT 0",
+            "daily_play_limit": "INTEGER DEFAULT 10",
+            "muted_users_json": "TEXT DEFAULT '[]'",
+            "warnings_json": "TEXT DEFAULT '{}'",
+            "filtered_words_json": "TEXT DEFAULT '[]'",
+        }
+        for col, col_def in migrations.items():
+            if col not in existing_cols:
+                cur.execute(f"ALTER TABLE groups ADD COLUMN {col} {col_def}")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS members (
                 chat_id TEXT,
@@ -123,7 +133,7 @@ class BotDatabase:
         """)
         self.conn.commit()
 
-    def ensure_group(self, chat_id: str, title: str = "گروه موزیکال اصلی") -> sqlite3.Row:
+    def ensure_group(self, chat_id: str, title: str = "خب") -> sqlite3.Row:
         cur = self.conn.cursor()
         cur.execute("SELECT * FROM groups WHERE chat_id = ?", (chat_id,))
         row = cur.fetchone()
@@ -141,29 +151,6 @@ class BotDatabase:
             cur.execute("SELECT * FROM groups WHERE chat_id = ?", (chat_id,))
             row = cur.fetchone()
         return row
-
-    def list_groups(self) -> List[Dict[str, Any]]:
-        self.ensure_group("g_main_rubika", "گروه موزیکال اصلی")
-        cur = self.conn.cursor()
-        cur.execute("SELECT * FROM groups")
-        items = []
-        for r in cur.fetchall():
-            items.append({
-                "chat_id": r["chat_id"],
-                "title": r["title"],
-                "owner_id": r["owner_id"],
-                "public_access": r["public_access"],
-                "volume": r["volume"],
-                "is_muted": bool(r["is_muted"]),
-                "is_playing": bool(r["is_playing"]),
-                "voice_call_active": bool(r["voice_call_active"]),
-                "current_track": json.loads(r["current_track"]) if r["current_track"] else None,
-                "queue": json.loads(r["queue_json"] or "[]"),
-                "history": json.loads(r["history_json"] or "[]"),
-                "auto_shutdown_time": r["auto_shutdown_time"],
-                "expires_at": r["expires_at"],
-            })
-        return items
 
     def get_role(self, chat_id: str, user_id: str) -> str:
         if user_id == CREATOR_ID:
@@ -194,46 +181,138 @@ class BotDatabase:
 class RubikaMusicBot:
     def __init__(self) -> None:
         self.db = BotDatabase(DB_PATH)
-        self.token = os.getenv("RUBIKA_BOT_TOKEN", BOT_TOKEN)
         self.offset: Optional[str] = None
         self.session: Optional[aiohttp.ClientSession] = None
         self.running = False
-        self.polling_enabled = True
-        self.logs: List[str] = []
-        self.last_verify: Optional[Dict[str, Any]] = None
-
-    def add_log(self, msg: str) -> None:
-        ts = datetime.now().strftime("%H:%M:%S")
-        line = f"[{ts}] {msg}"
-        print(line, flush=True)
-        self.logs.append(line)
-        if len(self.logs) > 80:
-            self.logs = self.logs[-80:]
 
     async def api_call(self, method: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        if self.session is None:
-            return {"status": "ERROR", "error": "Session not ready"}
-        url = f"{get_api_base(self.token)}/{method}"
-        try:
-            async with self.session.post(url, json=payload or {}, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-                try:
-                    return await resp.json()
-                except Exception:
-                    return {"status": "ERROR", "raw": await resp.text()}
-        except Exception as exc:
-            return {"status": "ERROR", "error": str(exc)}
+        assert self.session is not None
+        url = f"{API_BASE}/{method}"
+        async with self.session.post(url, json=payload or {}, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+            try:
+                return await resp.json()
+            except Exception:
+                return {"status": "ERROR", "raw": await resp.text()}
 
-    async def send_text(self, chat_id: str, text: str, reply_to: Optional[str] = None, send_remote: bool = True) -> Dict[str, Any]:
-        if not send_remote or chat_id == "g_main_rubika":
-            return {"status": "LOCAL_OK", "text": text}
-        payload: Dict[str, Any] = {"chat_id": chat_id, "text": text}
+    @staticmethod
+    def strip_emoji_cmd(text: str) -> str:
+        cleaned = re.sub(r"[\U0001F300-\U0001FAFF\u2600-\u27BF\uFE0F]", "", text or "")
+        return re.sub(r"\s+", " ", cleaned).strip()
+
+    @staticmethod
+    def build_keypad(menu: str = "main") -> Dict[str, Any]:
+        def btn(bid: str, label: str) -> Dict[str, str]:
+            return {"id": bid, "type": "Simple", "button_text": label}
+
+        if menu == "help":
+            return {
+                "rows": [
+                    {"buttons": [btn("btn_locks", "قفل‌ها 🔒"), btn("btn_admins", "مدیران 🛡️"), btn("btn_install", "نصب 📦")]},
+                    {"buttons": [btn("btn_mute", "سکوت 🔇"), btn("btn_warn", "اخطار ⚠️"), btn("btn_violations", "تخلفات 🚨")]},
+                    {"buttons": [btn("btn_stats", "آمار 📊"), btn("btn_clean", "پاکسازی 🧹"), btn("btn_kill", "Kill ⚔️")]},
+                    {"buttons": [btn("btn_tips", "نکات 📝"), btn("btn_filter", "فیلتر 🔍"), btn("btn_fun", "سرگرمی 🎭")]},
+                    {"buttons": [btn("btn_back_menu", "بازگشت به منو 🔙")]},
+                ],
+                "resize_keyboard": True,
+                "on_time_keyboard": False,
+            }
+        return {
+            "rows": [
+                {"buttons": [btn("btn_help", "راهنمای جامع 📚"), btn("btn_play", "پخش آهنگ 🎵"), btn("btn_call", "ساخت کال 📞")]},
+                {"buttons": [btn("btn_queue", "صف پخش 📋"), btn("btn_stats", "آمار 📊"), btn("btn_install", "نصب 📦")]},
+                {"buttons": [btn("btn_status", "وضعیت اشتراک 🔐"), btn("btn_admins", "مدیران 🛡️"), btn("btn_fun", "سرگرمی 🎭")]},
+            ],
+            "resize_keyboard": True,
+            "on_time_keyboard": False,
+        }
+
+    def get_daily_quota(self, chat_id: str) -> Dict[str, int]:
+        grp = self.db.ensure_group(chat_id)
+        today = datetime.now().strftime("%Y-%m-%d")
+        limit = grp["daily_play_limit"] or 10
+        count = grp["daily_play_count"] if grp["daily_play_date"] == today else 0
+        if grp["daily_play_date"] != today:
+            self.db.update_group(chat_id, daily_play_date=today, daily_play_count=0)
+        return {"count": count, "limit": limit}
+
+    def increment_daily_quota(self, chat_id: str) -> Dict[str, int]:
+        quota = self.get_daily_quota(chat_id)
+        new_count = quota["count"] + 1
+        today = datetime.now().strftime("%Y-%m-%d")
+        self.db.update_group(chat_id, daily_play_date=today, daily_play_count=new_count)
+        return {"count": new_count, "limit": quota["limit"]}
+
+    async def send_text(
+        self,
+        chat_id: str,
+        text: str,
+        reply_to: Optional[str] = None,
+        keypad_menu: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        grp = self.db.ensure_group(chat_id)
+        menu = keypad_menu or grp["active_menu"] or "main"
+        payload: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": text,
+            "chat_keypad": self.build_keypad(menu),
+            "chat_keypad_type": "New",
+        }
         if reply_to:
             payload["reply_to_message_id"] = reply_to
         return await self.api_call("sendMessage", payload)
 
+    async def send_music_file(
+        self,
+        chat_id: str,
+        audio_url: str,
+        title: str,
+        caption: str,
+        reply_to: Optional[str] = None,
+    ) -> bool:
+        assert self.session is not None
+        try:
+            async with self.session.get(audio_url, timeout=aiohttp.ClientTimeout(total=18)) as dl:
+                if dl.status != 200:
+                    return False
+                raw_bytes = await dl.read()
+            if len(raw_bytes) < 128:
+                return False
+
+            is_mp3 = (
+                raw_bytes[:3] == b"ID3"
+                or (raw_bytes[0] == 0xFF and (raw_bytes[1] & 0xE0) == 0xE0)
+                or ".mp3" in audio_url.lower()
+            )
+            req_type = "Music" if is_mp3 else "File"
+            ext = "mp3" if is_mp3 else "m4a"
+            mime = "audio/mpeg" if is_mp3 else "audio/mp4"
+
+            req_res = await self.api_call("requestSendFile", {"type": req_type})
+            upload_url = (req_res.get("data") or {}).get("upload_url")
+            if not upload_url:
+                return False
+
+            form = aiohttp.FormData()
+            safe_name = re.sub(r'[\\/:*?"<>|]+', " ", title).strip()[:48] or "song"
+            form.add_field("file", raw_bytes, filename=f"{safe_name}.{ext}", content_type=mime)
+
+            async with self.session.post(upload_url, data=form, timeout=aiohttp.ClientTimeout(total=25)) as up_resp:
+                up_json = await up_resp.json(content_type=None)
+            file_id = (up_json.get("data") or {}).get("file_id")
+            if not file_id:
+                return False
+
+            send_payload: Dict[str, Any] = {"chat_id": chat_id, "file_id": file_id, "text": caption}
+            if reply_to:
+                send_payload["reply_to_message_id"] = reply_to
+            sent = await self.api_call("sendFile", send_payload)
+            return sent.get("status") == "OK"
+        except Exception as e:
+            print(f"[SendMusicError] {e}")
+            return False
+
     async def search_music(self, query: str, limit: int = 50) -> List[Dict[str, Any]]:
-        if self.session is None:
-            return []
+        assert self.session is not None
         url = f"https://itunes.apple.com/search?term={quote(query)}&media=music&entity=song&limit={limit}"
         try:
             async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -250,7 +329,7 @@ class RubikaMusicBot:
                             })
                     return results
         except Exception as e:
-            self.add_log(f"SearchError: {e}")
+            print(f"[SearchError] {e}")
         return []
 
     def has_permission(self, chat_id: str, user_id: str) -> bool:
@@ -259,13 +338,17 @@ class RubikaMusicBot:
             return True
         return self.db.get_role(chat_id, user_id) in {"creator", "owner", "admin", "vip"}
 
-    async def handle_message(self, msg: Dict[str, Any], send_remote: bool = True) -> str:
-        chat_id = str(msg.get("chat_id", "g_main_rubika"))
-        sender_id = str(msg.get("sender_id", CREATOR_ID))
+    async def handle_message(self, msg: Dict[str, Any]) -> None:
+        chat_id = str(msg.get("chat_id", ""))
+        sender_id = str(msg.get("sender_id", ""))
         message_id = str(msg.get("message_id", ""))
-        text = (msg.get("text") or "").strip()
-        if not chat_id or not text:
-            return ""
+        aux_data = msg.get("aux_data") or {}
+        raw_text = (msg.get("text") or aux_data.get("button_id") or "").strip()
+        text = raw_text
+        cmd = self.strip_emoji_cmd(raw_text)
+        cmd_lower = cmd.lower()
+        if not chat_id or not raw_text:
+            return
 
         grp = self.db.ensure_group(chat_id)
         role = self.db.get_role(chat_id, sender_id)
@@ -274,13 +357,204 @@ class RubikaMusicBot:
         reply_text = (reply_msg.get("text") or "").strip()
         reply_file = reply_msg.get("file_inline") or {}
 
-        async def reply(out_text: str) -> str:
-            self.add_log(f"[{chat_id}] {text} -> {out_text.splitlines()[0]}")
-            await self.send_text(chat_id, out_text, message_id or None, send_remote=send_remote)
-            return out_text
+        # ناوبری منوی کیپد شیشه‌ای / پاسخگوی روبیکا
+        if cmd in {"بازگشت به منو", "منو", "منوی اصلی"} or cmd_lower in {"/menu", "btn_back_menu"}:
+            self.db.update_group(chat_id, active_menu="main")
+            await self.send_text(chat_id, "به منوی اصلی بازگشتید: 👋", message_id, keypad_menu="main")
+            return
 
-        if text in {"راهنما", "راهنمای ربات", "/start", "/help"}:
-            return await reply(HELP_TEXT)
+        if cmd in {"راهنمای جامع", "راهنما", "راهنمای ربات", "راهنمای ربات موزیکال"} or cmd_lower in {"/start", "/help", "btn_help"} or cmd.startswith("/start@"):
+            self.db.update_group(chat_id, active_menu="help")
+            await self.send_text(
+                chat_id,
+                "راهنمای جامع ربات 📚\n\nبرای مطالعه آموزش هر بخش، روی دکمه مربوطه کلیک کنید:\n━━━━━━━━━━━━━━━",
+                message_id,
+                keypad_menu="help",
+            )
+            return
+
+        if cmd_lower == "/get":
+            quota = self.get_daily_quota(chat_id)
+            cur_track = json.loads(grp["current_track"]) if grp["current_track"] else None
+            q_list = json.loads(grp["queue_json"] or "[]")
+            cur_label = f"{cur_track['title']} — {cur_track.get('artist', '')}" if cur_track else "هیچ"
+            await self.send_text(
+                chat_id,
+                f"📡 گزارش زنده گروه «{grp['title']}»\n"
+                f"📞 گفتگوی گروهی (ویسکال): {'فعال ✅' if grp['voice_call_active'] else 'غیرفعال'}\n"
+                f"🎵 آهنگ جاری: {cur_label}\n"
+                f"📋 تعداد صف پخش: {len(q_list)}\n"
+                f"📊 سهمیهٔ امروز: {quota['count']}/{quota['limit']}",
+                message_id,
+            )
+            return
+
+        if cmd in {"قفل‌ها", "قفل ها"} or cmd_lower == "btn_locks":
+            acc = "باز 🔓 (همه اعضا مجازند)" if grp["public_access"] == "open" else "قفل 🔒 (فقط ویژه و مدیران)"
+            await self.send_text(
+                chat_id,
+                f"🔒 بخش قفل‌ها و دسترسی گروه\n\n• وضعیت دسترسی عمومی: {acc}\n• باز کردن: دسترسی عموم باز\n• قفل کردن: دسترسی عموم قفل باشد\n• فیلتر کلمه: فیلتر {{کلمه}}",
+                message_id,
+            )
+            return
+
+        if cmd == "مدیران" or cmd_lower == "btn_admins":
+            await self.send_text(
+                chat_id,
+                f"🛡️ بخش مدیران گروه\n• شناسه مالک: {grp['owner_id']}\n• سازنده ربات: {CREATOR_NAME}\n\nدستورات مدیریتی (با ریپلای): تنظیم مالک | ویژه | حذف ویژه | مقام",
+                message_id,
+            )
+            return
+
+        if cmd == "نصب" or cmd_lower == "btn_install":
+            exp = datetime.strptime(grp["expires_at"], "%Y-%m-%d")
+            days_left = max(0, (exp - datetime.now()).days)
+            await self.send_text(
+                chat_id,
+                f"📦 وضعیت نصب ربات در گروه\n• شناسه چت: {chat_id}\n• وضعیت: نصب‌شده و فعال ✅\n• اعتبار اشتراک: {days_left} روز باقیمانده",
+                message_id,
+            )
+            return
+
+        if cmd == "سکوت" or cmd_lower == "btn_mute":
+            muted_users = json.loads(grp["muted_users_json"] or "[]")
+            if reply_sender_id and role in {"creator", "owner", "admin"}:
+                if reply_sender_id in muted_users:
+                    muted_users.remove(reply_sender_id)
+                    self.db.update_group(chat_id, muted_users_json=json.dumps(muted_users))
+                    await self.send_text(chat_id, f"🔊 سکوت کاربر {reply_sender_id} برداشته شد.", message_id)
+                else:
+                    muted_users.append(reply_sender_id)
+                    self.db.update_group(chat_id, muted_users_json=json.dumps(muted_users))
+                    await self.send_text(chat_id, f"🔇 کاربر {reply_sender_id} در حالت سکوت قرار گرفت.", message_id)
+            else:
+                await self.send_text(
+                    chat_id,
+                    f"🔇 بخش سکوت\n• صدای ربات در ویسکال: {'بیصدا 🔇' if grp['is_muted'] else 'باصدا 🔊'}\n• کاربران در سکوت: {len(muted_users)}\n• دستورات: بیصدا | باصدا | ریپلای + سکوت",
+                    message_id,
+                )
+            return
+
+        if cmd == "اخطار" or cmd_lower == "btn_warn":
+            warnings = json.loads(grp["warnings_json"] or "{}")
+            if reply_sender_id and role in {"creator", "owner", "admin"}:
+                cnt = int(warnings.get(reply_sender_id, 0)) + 1
+                warnings[reply_sender_id] = cnt
+                self.db.update_group(chat_id, warnings_json=json.dumps(warnings))
+                await self.send_text(chat_id, f"⚠️ اخطار به کاربر {reply_sender_id} ثبت شد ({cnt}/3).", message_id)
+            else:
+                total_w = sum(int(v) for v in warnings.values())
+                await self.send_text(chat_id, f"⚠️ سیستم اخطار گروه\n• کل اخطارهای ثبت‌شده: {total_w}\n• روش ثبت: روی پیام کاربر ریپلای کنید و ارسال کنید: اخطار", message_id)
+            return
+
+        if cmd == "تخلفات" or cmd_lower == "btn_violations":
+            warnings = json.loads(grp["warnings_json"] or "{}")
+            if warnings:
+                lines = [f"• کاربر {uid}: {cnt}/3 اخطار" for uid, cnt in warnings.items()]
+                await self.send_text(chat_id, "🚨 گزارش تخلفات و اخطارهای گروه:\n\n" + "\n".join(lines), message_id)
+            else:
+                await self.send_text(chat_id, "🚨 گزارش تخلفات:\n• هیچ تخلفی ثبت نشده است ✅", message_id)
+            return
+
+        if cmd == "آمار" or cmd_lower == "btn_stats":
+            quota = self.get_daily_quota(chat_id)
+            q_list = json.loads(grp["queue_json"] or "[]")
+            h_list = json.loads(grp["history_json"] or "[]")
+            await self.send_text(
+                chat_id,
+                f"📊 آمار زنده گروه «{grp['title']}»\n\n"
+                f"🎵 آهنگ‌های پخش‌شده: {len(h_list)}\n"
+                f"📊 سهمیهٔ امروز: {quota['count']}/{quota['limit']}\n"
+                f"📋 صف انتظار: {len(q_list)} آهنگ\n"
+                f"📞 وضعیت ویسکال: {'فعال ✅' if grp['voice_call_active'] else 'غیرفعال'}",
+                message_id,
+            )
+            return
+
+        if cmd == "پاکسازی" or cmd_lower == "btn_clean":
+            q_list = json.loads(grp["queue_json"] or "[]")
+            await self.send_text(
+                chat_id,
+                f"🧹 بخش پاکسازی\n• آهنگ‌های در صف: {len(q_list)}\n• پاک کردن کل صف: پاک کردن صف\n• حذف یک مورد: حذف از صف {{شماره}}",
+                message_id,
+            )
+            return
+
+        if cmd_lower in {"kill", "btn_kill"}:
+            if grp["voice_call_active"] and role in {"creator", "owner", "admin"}:
+                self.db.update_group(chat_id, is_playing=0, voice_call_active=0)
+                await self.send_text(chat_id, "⚔️ دستور Kill اجرا شد: گفتگوی گروهی و پخش فوراً متوقف گردید.", message_id)
+            else:
+                await self.send_text(chat_id, "⚔️ دستور Kill\n• برای قطع اضطراری ویسکال و پخش استفاده می‌شود.", message_id)
+            return
+
+        if cmd == "نکات" or cmd_lower == "btn_tips":
+            await self.send_text(
+                chat_id,
+                "📝 نکات کلیدی ربات:\n"
+                "1️⃣ با «پخش آهنگ بهنام بانی» ربات خودکار گفتگوی گروهی را شروع و آهنگ را پخش می‌کند.\n"
+                "2️⃣ با /get وضعیت لحظه‌ای گروه و سهمیه را ببینید.\n"
+                "3️⃣ با «تنظیم خاموشی 23:30» ساعت قطع خودکار ویسکال را تنظیم کنید.",
+                message_id,
+            )
+            return
+
+        if cmd == "فیلتر" or cmd.startswith("فیلتر ") or cmd_lower == "btn_filter":
+            words = json.loads(grp["filtered_words_json"] or "[]")
+            if cmd.startswith("فیلتر ") and role in {"creator", "owner", "admin"}:
+                w = cmd[len("فیلتر "):].strip()
+                if w and w not in words:
+                    words.append(w)
+                    self.db.update_group(chat_id, filtered_words_json=json.dumps(words, ensure_ascii=False))
+                await self.send_text(chat_id, f"🔍 کلمه «{w}» به فیلتر گروه اضافه شد.", message_id)
+            else:
+                await self.send_text(
+                    chat_id,
+                    f"🔍 بخش فیلتر کلمات\n• کلمات فیلترشده ({len(words)}): {'، '.join(words) if words else 'خالی'}\n• افزودن: فیلتر {{کلمه}} | حذف: حذف فیلتر {{کلمه}}",
+                    message_id,
+                )
+            return
+
+        if cmd.startswith("حذف فیلتر ") and role in {"creator", "owner", "admin"}:
+            w = cmd[len("حذف فیلتر "):].strip()
+            words = [item for item in json.loads(grp["filtered_words_json"] or "[]") if item != w]
+            self.db.update_group(chat_id, filtered_words_json=json.dumps(words, ensure_ascii=False))
+            await self.send_text(chat_id, f"🗑 کلمه «{w}» از لیست فیلتر حذف شد.", message_id)
+            return
+
+        if cmd == "سرگرمی" or cmd_lower == "btn_fun":
+            await self.send_text(
+                chat_id,
+                "🎭 بخش سرگرمی گروه\n• دستور سریع: پخش رندوم | پخش رندوم شاد | آهنگ لری",
+                message_id,
+            )
+            return
+
+        if cmd == "پخش آهنگ" or cmd_lower == "btn_play":
+            await self.send_text(
+                chat_id,
+                "🎵 برای پخش فوری در گفتگوی گروهی بنویسید:\n• پخش آهنگ بهنام بانی\n• پخش آهنگ شادمهر عقیلی\n• آهنگ لری",
+                message_id,
+            )
+            return
+
+        if cmd == "صف پخش" or cmd_lower == "btn_queue":
+            q_list = json.loads(grp["queue_json"] or "[]")
+            if not q_list:
+                await self.send_text(chat_id, "📋 صف پخش در حال حاضر خالی است.", message_id)
+            else:
+                lines = [f"{i+1}. {t['title']} - {t.get('artist', '')}" for i, t in enumerate(q_list)]
+                await self.send_text(chat_id, "📋 لیست صف پخش:\n" + "\n".join(lines), message_id)
+            return
+
+        # دستورات عمومی و راهنما
+        if cmd in {"ربات", "بات", "آنلاین"}:
+            await self.send_text(
+                chat_id,
+                "🤖 بله! ربات موزیکال آنلاین و فعال است ✅\n🎧 مثال: پخش آهنگ بهنام بانی\n📞 ساخت کال | 📚 راهنمای جامع",
+                message_id,
+            )
+            return
 
         if text == "مقام":
             role_labels = {
@@ -290,16 +564,18 @@ class RubikaMusicBot:
                 "vip": "کاربر ویژه",
                 "member": "کاربر عادی",
             }
-            return await reply(f"🔵 مقام شما در این گروه: {role_labels.get(role, 'عادی')}")
+            await self.send_text(chat_id, f"🔵 مقام شما در این گروه: {role_labels.get(role, 'عادی')}", message_id)
+            return
 
         if text == "مالک گروه":
-            return await reply(f"🟢 شناسه مالک فعلی گروه: {grp['owner_id']}")
+            await self.send_text(chat_id, f"🟢 شناسه مالک فعلی گروه: {grp['owner_id']}", message_id)
+            return
 
-        if text == "وضعیت":
+        if cmd in {"وضعیت", "وضعیت اشتراک"} or cmd_lower == "btn_status":
             exp = datetime.strptime(grp["expires_at"], "%Y-%m-%d")
             days_left = max(0, (exp - datetime.now()).days)
             access_fa = "باز برای همه اعضا" if grp["public_access"] == "open" else "قفل (فقط ویژه و ادمین)"
-            return await reply(
+            status_msg = (
                 f"🔐 وضعیت اشتراک ربات موزیکال\n"
                 f"📅 تاریخ خرید: {grp['purchased_at']}\n"
                 f"⏳ تاریخ انقضا: {grp['expires_at']}\n"
@@ -307,92 +583,121 @@ class RubikaMusicBot:
                 f"🔓 دسترسی عمومی: {access_fa}\n"
                 f"👑 سازنده: {CREATOR_NAME}"
             )
+            await self.send_text(chat_id, status_msg, message_id)
+            return
 
+        # دستورات مدیریت مالکیت و دسترسی
         if text == "تنظیم مالک":
             if role != "creator":
-                return await reply("⛔ فقط سازنده ربات مجاز به تعیین مالک گروه است.")
+                await self.send_text(chat_id, "⛔ فقط سازنده ربات مجاز به تعیین مالک گروه است.", message_id)
+                return
             if not reply_sender_id:
-                return await reply("⚠ لطفاً روی پیام کاربر مورد نظر ریپلای کنید.")
+                await self.send_text(chat_id, "⚠ لطفاً روی پیام کاربر مورد نظر ریپلای کنید.", message_id)
+                return
             self.db.update_group(chat_id, owner_id=reply_sender_id)
             self.db.set_role(chat_id, reply_sender_id, "owner")
-            return await reply(f"👑 کاربر {reply_sender_id} به عنوان مالک گروه تنظیم شد.")
+            await self.send_text(chat_id, f"👑 کاربر {reply_sender_id} به عنوان مالک گروه تنظیم شد.", message_id)
+            return
 
         if text == "ویژه":
             if role not in {"creator", "owner", "admin"}:
-                return await reply("⛔ فقط مالک یا ادمین گروه مجاز است.")
+                await self.send_text(chat_id, "⛔ فقط مالک یا ادمین گروه مجاز است.", message_id)
+                return
             if not reply_sender_id:
-                return await reply("⚠ لطفاً روی پیام کاربر ریپلای کنید و ارسال کنید: ویژه")
+                await self.send_text(chat_id, "⚠ لطفاً روی پیام کاربر ریپلای کنید و ارسال کنید: ویژه", message_id)
+                return
             self.db.set_role(chat_id, reply_sender_id, "vip")
-            return await reply(f"⭐ کاربر {reply_sender_id} با موفقیت ویژه شد.")
+            await self.send_text(chat_id, f"⭐ کاربر {reply_sender_id} با موفقیت ویژه شد.", message_id)
+            return
 
         if text == "حذف ویژه":
             if role not in {"creator", "owner"}:
-                return await reply("⛔ فقط مالک گروه یا سازنده ربات می‌تواند ویژه را حذف کند.")
+                await self.send_text(chat_id, "⛔ فقط مالک گروه یا سازنده ربات می‌تواند ویژه را حذف کند.", message_id)
+                return
             if not reply_sender_id:
-                return await reply("⚠ روی پیام کاربر ریپلای کنید.")
+                await self.send_text(chat_id, "⚠ روی پیام کاربر ریپلای کنید.", message_id)
+                return
             self.db.set_role(chat_id, reply_sender_id, "member")
-            return await reply(f"🗑 وضعیت ویژه کاربر {reply_sender_id} حذف شد.")
+            await self.send_text(chat_id, f"🗑 وضعیت ویژه کاربر {reply_sender_id} حذف شد.", message_id)
+            return
 
         if text == "دسترسی عموم باز":
             if role not in {"creator", "owner", "admin"}:
-                return await reply("⛔ دسترسی تغییر تنظیمات ندارید.")
+                await self.send_text(chat_id, "⛔ دسترسی تغییر تنظیمات ندارید.", message_id)
+                return
             self.db.update_group(chat_id, public_access="open")
-            return await reply("🔓 دسترسی عمومی باز شد. همه اعضا می‌توانند از ربات استفاده کنند.")
+            await self.send_text(chat_id, "🔓 دسترسی عمومی باز شد. همه اعضا می‌توانند از ربات استفاده کنند.", message_id)
+            return
 
         if text == "دسترسی عموم قفل باشد":
             if role not in {"creator", "owner", "admin"}:
-                return await reply("⛔ دسترسی تغییر تنظیمات ندارید.")
+                await self.send_text(chat_id, "⛔ دسترسی تغییر تنظیمات ندارید.", message_id)
+                return
             self.db.update_group(chat_id, public_access="locked")
-            return await reply("🔒 دسترسی عمومی قفل شد. فقط کاربران ویژه و ادمین‌ها دسترسی دارند.")
+            await self.send_text(chat_id, "🔒 دسترسی عمومی قفل شد. فقط کاربران ویژه و ادمین‌ها دسترسی دارند.", message_id)
+            return
 
+        # بررسی دسترسی برای دستورات پخش موسیقی
         if not self.has_permission(chat_id, sender_id):
-            return await reply("🔒 دسترسی عمومی قفل است. فقط کاربران ویژه و ادمین‌ها مجاز هستند.")
+            await self.send_text(chat_id, "🔒 دسترسی عمومی قفل است. فقط کاربران ویژه و ادمین‌ها مجاز هستند.", message_id)
+            return
 
         queue: List[Dict[str, Any]] = json.loads(grp["queue_json"] or "[]")
         history: List[Dict[str, Any]] = json.loads(grp["history_json"] or "[]")
         current = json.loads(grp["current_track"]) if grp["current_track"] else None
         paused = json.loads(grp["paused_track"]) if grp["paused_track"] else None
 
-        if text == "ساخت کال":
+        if cmd == "ساخت کال" or cmd_lower == "btn_call":
             self.db.update_group(chat_id, voice_call_active=1)
-            return await reply("📞 ویس‌چت (کال) گروه فعال شد. ربات آماده پخش موسیقی در کال است.")
+            await self.send_text(chat_id, "📞 ویس‌چت (کال) گروه فعال شد. ربات آماده پخش موسیقی در کال است.", message_id)
+            return
 
         if text == "بیصدا":
             self.db.update_group(chat_id, is_muted=1)
-            return await reply("🟣 ربات در کال بی‌صدا شد (آهنگ در پس‌زمینه در حال پخش است).")
+            await self.send_text(chat_id, "🟣 ربات در کال بی‌صدا شد (آهنگ در پس‌زمینه در حال پخش است).", message_id)
+            return
 
         if text == "باصدا":
             self.db.update_group(chat_id, is_muted=0)
-            return await reply("🟠 ربات از حالت بی‌صدا خارج شد و آهنگ در حال پخش است ✅")
+            await self.send_text(chat_id, "🟠 ربات از حالت بی‌صدا خارج شد و آهنگ در حال پخش است ✅", message_id)
+            return
 
         vol_match = re.match(r"^تنظیم صدا\s+(\d{1,3})$", text)
         if vol_match:
             vol = max(0, min(100, int(vol_match.group(1))))
             self.db.update_group(chat_id, volume=vol)
-            return await reply(f"🔊 صدای پخش روی {vol} درصد تنظیم شد.")
+            await self.send_text(chat_id, f"🔊 صدای پخش روی {vol} درصد تنظیم شد.", message_id)
+            return
 
         if text in {"قطع ویسکال", "توقف آهنگ", "خروج", "توقف"}:
             if current:
                 self.db.update_group(chat_id, paused_track=json.dumps(current, ensure_ascii=False), current_track=None, is_playing=0)
-                return await reply(f"⏹ پخش آهنگ «{current['title']}» متوقف و برای ادامه ذخیره شد.")
-            self.db.update_group(chat_id, is_playing=0, voice_call_active=0)
-            return await reply("⏹ ویسکال متوقف شد.")
+                await self.send_text(chat_id, f"⏹ پخش آهنگ «{current['title']}» متوقف و برای ادامه ذخیره شد.", message_id)
+            else:
+                self.db.update_group(chat_id, is_playing=0, voice_call_active=0)
+                await self.send_text(chat_id, "⏹ ویسکال متوقف شد.", message_id)
+            return
 
         if text == "ادامه آهنگ":
             if paused:
                 self.db.update_group(chat_id, current_track=json.dumps(paused, ensure_ascii=False), paused_track=None, is_playing=1, voice_call_active=1)
-                return await reply(f"▶️ ادامه پخش آهنگ «{paused['title']}» در ویسکال.")
-            return await reply("⚠ آهنگ متوقف‌شده‌ای برای ادامه وجود ندارد.")
+                await self.send_text(chat_id, f"▶️ ادامه پخش آهنگ «{paused['title']}» در ویسکال.", message_id)
+            else:
+                await self.send_text(chat_id, "⚠ آهنگ متوقف‌شده‌ای برای ادامه وجود ندارد.", message_id)
+            return
 
         if text in {"صف", "لیست پخش"}:
             if not queue:
-                return await reply("📋 صف پخش در حال حاضر خالی است.")
+                await self.send_text(chat_id, "📋 صف پخش در حال حاضر خالی است.", message_id)
+                return
             lines = [f"{i+1}. {t['title']} - {t.get('artist', '')}" for i, t in enumerate(queue)]
-            return await reply("📋 لیست صف پخش:\n" + "\n".join(lines))
+            await self.send_text(chat_id, "📋 لیست صف پخش:\n" + "\n".join(lines), message_id)
+            return
 
         if text == "پاک کردن صف":
             self.db.update_group(chat_id, queue_json="[]")
-            return await reply("🗑 کل صف پخش پاک شد.")
+            await self.send_text(chat_id, "🗑 کل صف پخش پاک شد.", message_id)
+            return
 
         del_match = re.match(r"^حذف از صف\s+(\d+)$", text)
         if del_match:
@@ -400,19 +705,24 @@ class RubikaMusicBot:
             if 0 <= idx < len(queue):
                 removed = queue.pop(idx)
                 self.db.update_group(chat_id, queue_json=json.dumps(queue, ensure_ascii=False))
-                return await reply(f"🗑 آهنگ «{removed['title']}» از صف حذف شد.")
-            return await reply("⚠ شماره آهنگ در صف معتبر نیست.")
+                await self.send_text(chat_id, f"🗑 آهنگ «{removed['title']}» از صف حذف شد.", message_id)
+            else:
+                await self.send_text(chat_id, "⚠ شماره آهنگ در صف معتبر نیست.", message_id)
+            return
 
         if text == "تاریخچه آهنگها":
             last5 = history[-5:][::-1]
             if not last5:
-                return await reply("📜 تاریخچه آهنگ‌ها خالی است.")
+                await self.send_text(chat_id, "📜 تاریخچه آهنگ‌ها خالی است.", message_id)
+                return
             lines = [f"{i+1}. {t['title']} - {t.get('artist', '')}" for i, t in enumerate(last5)]
-            return await reply("📜 ۵ آهنگ آخر پخش‌شده:\n" + "\n".join(lines))
+            await self.send_text(chat_id, "📜 ۵ آهنگ آخر پخش‌شده:\n" + "\n".join(lines), message_id)
+            return
 
         if text == "بعدی":
             if not queue:
-                return await reply("⚠ صف خالی است.")
+                await self.send_text(chat_id, "⚠ صف خالی است.", message_id)
+                return
             if current:
                 history.append(current)
             nxt = queue.pop(0)
@@ -424,11 +734,13 @@ class RubikaMusicBot:
                 is_playing=1,
                 voice_call_active=1,
             )
-            return await reply(f"⏭ پخش آهنگ بعدی: {nxt['title']}")
+            await self.send_text(chat_id, f"⏭ پخش آهنگ بعدی: {nxt['title']}", message_id)
+            return
 
         if text == "قبلی":
             if not history:
-                return await reply("⚠ آهنگی در تاریخچه وجود ندارد.")
+                await self.send_text(chat_id, "⚠ آهنگی در تاریخچه وجود ندارد.", message_id)
+                return
             prev_track = history.pop()
             if current:
                 queue.insert(0, current)
@@ -440,19 +752,21 @@ class RubikaMusicBot:
                 is_playing=1,
                 voice_call_active=1,
             )
-            return await reply(f"⏮ بازگشت به آهنگ قبلی: {prev_track['title']}")
+            await self.send_text(chat_id, f"⏮ بازگشت به آهنگ قبلی: {prev_track['title']}", message_id)
+            return
 
         if text in {"پخش رندوم", "پخش رندوم شاد", "پخش شاد", "آهنگ شاد", "پخش رندوم غمگین", "پخش غمگین", "آهنگ غمگین"}:
-            happy_seeds = ["بهنام بانی", "ماکان بند", "پازل بند", "اندی", "سندی", "شهرام شب پره", "بنیامین بهادری", "محسن ابراهیم زاده"]
-            sad_seeds = ["محسن چاوشی", "محسن یگانه", "مرتضی پاشایی", "مجید خراطها", "رضا بهرام", "داریوش", "هایده", "مهستی"]
+            happy_seeds = ["بهنام بانی", "ماکان بند", "پازل بند", "اندی", "سندی", "شهرام شب پره", "بنیامین بهادری", "محسن ابراهیم زاده", "آهنگ شاد ایرانی"]
+            sad_seeds = ["محسن چاوشی", "محسن یگانه", "مرتضی پاشایی", "مجید خراطها", "رضا بهرام", "داریوش", "هایده", "مهستی", "علی یاسینی", "احسان خواجه امیری"]
             if "شاد" in text:
-                pool = await self.search_music(random.choice(happy_seeds), 40)
+                pool = await self.search_music(random.choice(happy_seeds), 50)
             elif "غمگین" in text:
-                pool = await self.search_music(random.choice(sad_seeds), 40)
+                pool = await self.search_music(random.choice(sad_seeds), 50)
             else:
-                pool = queue or history or await self.search_music(random.choice(happy_seeds + sad_seeds), 40)
+                pool = queue or history or await self.search_music(random.choice(happy_seeds + sad_seeds), 50)
             if not pool:
-                return await reply("⚠ آهنگی برای پخش تصادفی یافت نشد.")
+                await self.send_text(chat_id, "⚠ آهنگی برای پخش تصادفی یافت نشد.", message_id)
+                return
             chosen = random.choice(pool)
             if current:
                 history.append(current)
@@ -463,19 +777,26 @@ class RubikaMusicBot:
                 is_playing=1,
                 voice_call_active=1,
             )
-            return await reply(f"🎲 پخش تصادفی در ویسکال: {chosen['title']} - {chosen.get('artist', '')}")
+            caption = f"🎲 پخش تصادفی در ویسکال: {chosen['title']} - {chosen.get('artist', '')}"
+            sent_audio = await self.send_music_file(chat_id, chosen["url"], chosen["title"], caption, message_id)
+            if not sent_audio:
+                await self.send_text(chat_id, f"{caption}\n🔗 {chosen['url']}", message_id)
+            return
 
+        # پخش با لینک مستقیم، ریپلای، اضافه به صف یا پخش فوری
         url_match = re.search(r"(https?://\S+)", text) or re.search(r"(https?://\S+)", reply_text)
         if text.startswith("پخش ویسکال ") or text in {"پخش ریپلای", "پخش فوری", "اضافه به صف"} or text.startswith("پخش فوری ") or text.startswith("اضافه به صف "):
             track_url = url_match.group(1) if url_match else reply_file.get("file_id", "")
             track_title = reply_file.get("file_name") or text.replace("پخش ویسکال", "").strip() or "موزیک مستقیم"
             if not track_url:
-                return await reply("⚠ لینک مستقیم یا ریپلای روی فایل صوتی یافت نشد.")
+                await self.send_text(chat_id, "⚠ لینک مستقیم یا ریپلای روی فایل صوتی یافت نشد.", message_id)
+                return
             new_track = {"title": track_title, "artist": "لینک مستقیم", "url": track_url}
             if text.startswith("اضافه به صف"):
                 queue.append(new_track)
                 self.db.update_group(chat_id, queue_json=json.dumps(queue, ensure_ascii=False))
-                return await reply(f"➕ آهنگ «{new_track['title']}» به صف اضافه شد (شماره {len(queue)}).")
+                await self.send_text(chat_id, f"➕ آهنگ «{new_track['title']}» به صف اضافه شد (شماره {len(queue)}).", message_id)
+                return
             if current:
                 history.append(current)
             self.db.update_group(
@@ -486,13 +807,16 @@ class RubikaMusicBot:
                 voice_call_active=1,
             )
             mode_label = "⚡ پخش فوری" if "فوری" in text else "🎧 پخش در ویسکال"
-            return await reply(f"{mode_label}: {new_track['title']}")
+            await self.send_text(chat_id, f"{mode_label}: {new_track['title']}", message_id)
+            return
 
-        if text.startswith("آهنگ "):
-            query = text[len("آهنگ "):].strip()
+        play_match = re.match(r"^(پخش آهنگ|پخش موزیک|آهنگ|موزیک)\s+(.+)$", cmd)
+        if play_match:
+            query = play_match.group(2).strip()
             results = await self.search_music(query)
             if not results:
-                return await reply(f"❌ آهنگی با عنوان «{query}» پیدا نشد.")
+                await self.send_text(chat_id, f"❌ آهنگی با عنوان «{query}» پیدا نشد.", message_id)
+                return
             chosen = results[0]
             if current:
                 history.append(current)
@@ -503,22 +827,33 @@ class RubikaMusicBot:
                 is_playing=1,
                 voice_call_active=1,
             )
-            return await reply(f"🎵 در حال پخش در ویسکال:\n🎶 {chosen['title']} — {chosen['artist']}\n🔗 {chosen['url']}")
+            quota = self.increment_daily_quota(chat_id)
+            caption = (
+                f"🎶 پخش آغاز شد\n"
+                f"🎵 {chosen['title']} — {chosen['artist']} 320\n"
+                f"📊 سهمیهٔ امروز: {quota['count']}/{quota['limit']}"
+            )
+            sent_audio = await self.send_music_file(chat_id, chosen["url"], chosen["title"], caption, message_id)
+            if not sent_audio:
+                await self.send_text(chat_id, f"{caption}\n🔗 {chosen['url']}", message_id)
+            return
 
         if text.startswith("تنظیم خاموشی ") or text.startswith("خاموشی خودکار "):
             if role not in {"creator", "owner", "admin"}:
-                return await reply("⛔ فقط مالک، ادمین یا سازنده مجاز به تنظیم تایمر است.")
+                await self.send_text(chat_id, "⛔ فقط مالک، ادمین یا سازنده مجاز به تنظیم تایمر است.", message_id)
+                return
             t_str = text.split()[-1].strip()
             if not re.match(r"^([01]?\d|2[0-3]):[0-5]\d$", t_str):
-                return await reply("⚠ فرمت ساعت اشتباه است. مثال: تنظیم خاموشی 23:30")
+                await self.send_text(chat_id, "⚠ فرمت ساعت اشتباه است. مثال: تنظیم خاموشی 23:30", message_id)
+                return
             self.db.update_group(chat_id, auto_shutdown_time=t_str)
-            return await reply(f"⏰ تایمر قطع خودکار ویسکال روی ساعت {t_str} تنظیم شد.")
+            await self.send_text(chat_id, f"⏰ تایمر قطع خودکار ویسکال روی ساعت {t_str} تنظیم شد.", message_id)
+            return
 
         if text in {"لغو خاموشی", "لغو تایمر"}:
             self.db.update_group(chat_id, auto_shutdown_time=None)
-            return await reply("⏰ تایمر خاموشی خودکار ویسکال لغو شد.")
-
-        return ""
+            await self.send_text(chat_id, "⏰ تایمر خاموشی خودکار ویسکال لغو شد.", message_id)
+            return
 
     async def check_auto_shutdowns(self) -> None:
         now_hm = datetime.now().strftime("%H:%M")
@@ -529,182 +864,36 @@ class RubikaMusicBot:
             self.db.update_group(chat_id, is_playing=0, voice_call_active=0, auto_shutdown_time=None)
             await self.send_text(chat_id, f"⏰ زمان خودکار ({now_hm}) فرا رسید: ویسکال قطع شد و ربات متوقف گردید.")
 
-    def build_local_dashboard_html(self) -> str:
-        return """<!doctype html>
-<html lang="fa" dir="rtl">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>کنترلر ترموکس ربات روبیکا | پریا چش رنگی</title>
-<style>
-  body{margin:0;background:#0B0F17;color:#F1F5F9;font-family:system-ui,-apple-system,sans-serif;padding:16px}
-  .card{background:#111827;border:1px solid #1E293B;border-radius:14px;padding:16px;margin-bottom:14px}
-  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-  h1{font-size:18px;margin:0 0 6px;color:#34D399}
-  .muted{color:#94A3B8;font-size:12px}
-  button{background:#059669;color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:600;font-size:13px;cursor:pointer}
-  button.sec{background:#1E293B;color:#E2E8F0}
-  button.danger{background:#DC2626}
-  input{width:100%;box-sizing:border-box;background:#0B0F17;border:1px solid #334155;color:#F8FAFC;border-radius:10px;padding:10px 12px;font-size:13px;margin:8px 0}
-  pre{background:#0B0F17;border:1px solid #1E293B;border-radius:10px;padding:12px;font-size:11px;color:#A7F3D0;max-height:220px;overflow:auto;direction:ltr;text-align:left}
-</style>
-</head>
-<body>
-  <div class="card">
-    <h1>ربات موزیکال روبیکا — حالت ترموکس (Termux)</h1>
-    <div class="muted" id="meta">در حال بارگذاری وضعیت...</div>
-  </div>
-  <div class="card">
-    <div class="row">
-      <button onclick="verifyToken()">بررسی اتصال توکن (getMe)</button>
-      <button class="sec" onclick="togglePolling()">تغییر وضعیت دریافت زنده</button>
-      <button class="sec" onclick="runCmd('پخش رندوم شاد')">🎲 پخش شاد</button>
-      <button class="sec" onclick="runCmd('پخش رندوم غمگین')">🎵 پخش غمگین</button>
-      <button class="danger" onclick="runCmd('قطع ویسکال')">⏹ قطع ویسکال</button>
-    </div>
-    <input id="cmdInput" placeholder="دستور فارسی بفرستید (مثلا: آهنگ محسن چاوشی یا وضعیت)..." />
-    <button onclick="runCustom()">اجرای دستور</button>
-    <div id="replyBox" class="muted" style="margin-top:10px;white-space:pre-wrap;color:#E2E8F0"></div>
-  </div>
-  <div class="card">
-    <div class="muted" style="margin-bottom:6px">پخش فعلی و صف</div>
-    <div id="playerBox" style="font-size:13px"></div>
-    <audio id="audioEl" controls style="width:100%;margin-top:10px"></audio>
-  </div>
-  <div class="card">
-    <div class="muted" style="margin-bottom:6px">گزارش زنده ترموکس</div>
-    <pre id="logBox"></pre>
-  </div>
-<script>
-let lastTrackUrl = '';
-async function refresh(){
-  const r = await fetch('/api/state');
-  const d = await r.json();
-  document.getElementById('meta').textContent =
-    'سازنده: ' + d.creatorName + ' | دریافت زنده روبیکا: ' + (d.polling ? 'فعال ✅' : 'متوقف');
-  const g = d.groups[0];
-  if(g){
-    const cur = g.current_track;
-    document.getElementById('playerBox').textContent = cur
-      ? '🎶 ' + cur.title + ' — ' + (cur.artist || '') + ' | صف: ' + g.queue.length
-      : 'در حال حاضر آهنگی پخش نمی‌شود | صف: ' + g.queue.length;
-    if(cur && cur.url && cur.url !== lastTrackUrl){
-      lastTrackUrl = cur.url;
-      const a = document.getElementById('audioEl');
-      a.src = cur.url;
-      a.play().catch(()=>{});
-    }
-  }
-  document.getElementById('logBox').textContent = (d.logs || []).join('\n');
-}
-async function verifyToken(){
-  const r = await fetch('/api/bot/verify',{method:'POST'});
-  const d = await r.json();
-  document.getElementById('replyBox').textContent = JSON.stringify(d, null, 2);
-  refresh();
-}
-async function togglePolling(){
-  await fetch('/api/bot/toggle',{method:'POST'});
-  refresh();
-}
-async function runCmd(text){
-  const r = await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
-  const d = await r.json();
-  document.getElementById('replyBox').textContent = d.reply || 'اجرا شد';
-  refresh();
-}
-function runCustom(){
-  const el = document.getElementById('cmdInput');
-  if(el.value.trim()){ runCmd(el.value.trim()); el.value=''; }
-}
-refresh();
-setInterval(refresh, 3000);
-</script>
-</body>
-</html>"""
-
-    async def start_http_server(self) -> web.AppRunner:
-        app = web.Application()
-
-        async def handle_index(_request: web.Request) -> web.Response:
-            return web.Response(text=self.build_local_dashboard_html(), content_type="text/html", charset="utf-8")
-
-        async def handle_state(_request: web.Request) -> web.Response:
-            return web.json_response({
-                "ok": True,
-                "mode": "termux-python",
-                "creatorName": CREATOR_NAME,
-                "polling": self.polling_enabled,
-                "lastVerify": self.last_verify,
-                "groups": self.db.list_groups(),
-                "logs": self.logs[-30:],
-            })
-
-        async def handle_verify(_request: web.Request) -> web.Response:
-            res = await self.api_call("getMe")
-            self.last_verify = res
-            self.add_log(f"getMe -> {res.get('status', 'DONE')}")
-            return web.json_response(res)
-
-        async def handle_toggle(_request: web.Request) -> web.Response:
-            self.polling_enabled = not self.polling_enabled
-            self.add_log(f"Polling toggled -> {self.polling_enabled}")
-            return web.json_response({"polling": self.polling_enabled})
-
-        async def handle_command(request: web.Request) -> web.Response:
-            body = await request.json()
-            reply_text = await self.handle_message({
-                "chat_id": body.get("chat_id", "g_main_rubika"),
-                "sender_id": body.get("sender_id", CREATOR_ID),
-                "text": body.get("text", ""),
-            }, send_remote=bool(body.get("send_remote", False)))
-            return web.json_response({"ok": True, "reply": reply_text})
-
-        app.router.add_get("/", handle_index)
-        app.router.add_get("/api/state", handle_state)
-        app.router.add_post("/api/bot/verify", handle_verify)
-        app.router.add_post("/api/bot/toggle", handle_toggle)
-        app.router.add_post("/api/command", handle_command)
-
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", PORT)
-        await site.start()
-        self.add_log(f"Termux Web Control Server running at http://127.0.0.1:{PORT}")
-        return runner
-
-    async def run(self, with_web: bool = True) -> None:
+    async def run(self) -> None:
         self.running = True
-        runner: Optional[web.AppRunner] = None
         async with aiohttp.ClientSession() as session:
             self.session = session
-            if with_web:
-                runner = await self.start_http_server()
             me = await self.api_call("getMe")
-            self.last_verify = me
-            self.add_log(f"Rubika Bot Ready | Creator: {CREATOR_NAME} | getMe: {me.get('status', 'OK')}")
-            try:
-                while self.running:
-                    try:
-                        await self.check_auto_shutdowns()
-                        if self.polling_enabled:
-                            payload: Dict[str, Any] = {"limit": 50}
-                            if self.offset:
-                                payload["offset_id"] = self.offset
-                            res = await self.api_call("getUpdates", payload)
-                            updates = res.get("data", {}).get("updates", []) if isinstance(res.get("data"), dict) else []
-                            for upd in updates:
-                                self.offset = upd.get("next_offset_id") or self.offset
-                                if upd.get("new_message"):
-                                    await self.handle_message(upd["new_message"])
-                    except Exception as exc:
-                        self.add_log(f"PollingError: {exc}")
-                    await asyncio.sleep(1.5)
-            finally:
-                if runner:
-                    await runner.cleanup()
+            print(f"[RubikaMusicBot] سازنده: {CREATOR_NAME} | وضعیت توکن: {me}")
+            while self.running:
+                try:
+                    await self.check_auto_shutdowns()
+                    payload = {"limit": 50}
+                    if self.offset:
+                        payload["offset_id"] = self.offset
+                    res = await self.api_call("getUpdates", payload)
+                    data_obj = res.get("data") if isinstance(res.get("data"), dict) else {}
+                    if data_obj.get("next_offset_id"):
+                        self.offset = data_obj["next_offset_id"]
+                    updates = data_obj.get("updates", [])
+                    for upd in updates:
+                        outer_chat_id = str(upd.get("chat_id", ""))
+                        new_msg = upd.get("new_message")
+                        if isinstance(new_msg, dict) and new_msg.get("sender_type") != "Bot":
+                            msg_payload = dict(new_msg)
+                            if outer_chat_id and not msg_payload.get("chat_id"):
+                                msg_payload["chat_id"] = outer_chat_id
+                            await self.handle_message(msg_payload)
+                except Exception as exc:
+                    print(f"[PollingError] {exc}")
+                await asyncio.sleep(1.5)
 
 
 if __name__ == "__main__":
     bot = RubikaMusicBot()
-    asyncio.run(bot.run(with_web=True))
+    asyncio.run(bot.run())
